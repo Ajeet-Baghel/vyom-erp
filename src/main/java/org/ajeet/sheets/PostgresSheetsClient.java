@@ -10,6 +10,7 @@ import java.sql.Statement;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -137,6 +138,62 @@ public class PostgresSheetsClient implements SheetsClient {
         } catch (SQLException e) {
             throw new IOException("deleteRow failed: " + e.getMessage(), e);
         }
+    }
+
+    // ------------------------------------------------------- attendance API
+
+    /** One punch row for the portal: name resolved via the users join. */
+    public record AttendancePunch(int enrollNumber, String name, String time, String verifyLabel) {}
+
+    /** Punches for a single device user, newest first (the employee's own view). */
+    public synchronized List<AttendancePunch> punchesFor(int enrollNumber) throws IOException {
+        return punchRows("WHERE p.enroll_number = ?", enrollNumber);
+    }
+
+    /** Everyone who punched today - the admin dashboard card. */
+    public synchronized List<AttendancePunch> punchesToday() throws IOException {
+        return punchRows("WHERE p.punch_time::date = current_date", null);
+    }
+
+    /** All punches, newest first - the admin full log (capped). */
+    public synchronized List<AttendancePunch> punchesAll() throws IOException {
+        return punchRows("", null);
+    }
+
+    /** Device users not yet claimed by any web account - the approve dropdown. */
+    public synchronized Map<Integer, String> unlinkedUsers() throws IOException {
+        Map<Integer, String> out = new LinkedHashMap<>();
+        try (Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("""
+                     SELECT u.enroll_number, u.name FROM users u
+                     LEFT JOIN accounts a ON a.enroll_number = u.enroll_number
+                     WHERE a.id IS NULL ORDER BY u.enroll_number""")) {
+            while (rs.next()) out.put(rs.getInt(1), rs.getString(2));
+        } catch (SQLException e) {
+            throw new IOException("unlinked users failed: " + e.getMessage(), e);
+        }
+        return out;
+    }
+
+    private List<AttendancePunch> punchRows(String where, Integer enroll) throws IOException {
+        List<AttendancePunch> out = new ArrayList<>();
+        String sql = """
+                SELECT p.enroll_number, COALESCE(u.name,''),
+                       to_char(p.punch_time, 'YYYY-MM-DD HH24:MI:SS'), p.verify_label
+                FROM punches p LEFT JOIN users u ON u.enroll_number = p.enroll_number
+                """ + where + " ORDER BY p.punch_time DESC LIMIT 500";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            if (enroll != null) ps.setInt(1, enroll);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    out.add(new AttendancePunch(rs.getInt(1), rs.getString(2),
+                            rs.getString(3), rs.getString(4)));
+                }
+            }
+        } catch (SQLException e) {
+            throw new IOException("attendance query failed: " + e.getMessage(), e);
+        }
+        return out;
     }
 
     @Override

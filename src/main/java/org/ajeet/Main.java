@@ -1,5 +1,6 @@
 package org.ajeet;
 
+import org.ajeet.auth.AuthStore;
 import org.ajeet.device.DeviceClient;
 import org.ajeet.sheets.GoogleSheetsClient;
 import org.ajeet.sheets.MemorySheetsClient;
@@ -28,6 +29,7 @@ public class Main {
         String pgUrl = env("PG_URL", null);
 
         SheetsClient client;
+        PostgresSheetsClient pgClient = null;
         if (spreadsheetId != null && !spreadsheetId.isBlank()) {
             try {
                 client = new GoogleSheetsClient(SheetsAuth.resolve(), spreadsheetId);
@@ -39,8 +41,9 @@ public class Main {
             }
         } else if (pgUrl != null && !pgUrl.isBlank()) {
             try {
-                client = new PostgresSheetsClient(pgUrl,
+                pgClient = new PostgresSheetsClient(pgUrl,
                         env("PG_USER", "postgres"), env("PG_PASSWORD", ""));
+                client = pgClient;
                 System.out.println("Connected to PostgreSQL: " + pgUrl);
             } catch (Exception e) {
                 System.err.println("PostgreSQL connection failed: " + e.getMessage()
@@ -52,8 +55,21 @@ public class Main {
             client = new MemorySheetsClient();
         }
 
+        AuthStore auth = null;
+        if (pgClient != null) {
+            auth = new AuthStore(pgUrl,
+                    env("PG_USER", "postgres"), env("PG_PASSWORD", ""));
+            String adminEmail = env("ADMIN_EMAIL", null);
+            if (adminEmail != null && !adminEmail.isBlank()) {
+                auth.seedAdmin(adminEmail, env("ADMIN_PASSWORD", ""));
+                System.out.println("Admin account ready: " + adminEmail);
+            } else {
+                System.out.println("ADMIN_EMAIL not set -> no admin seeded (set it in .env)");
+            }
+        }
+
         DeviceClient device = buildDeviceClient();
-        new ApiServer(client, device).start(port);
+        new ApiServer(client, device, auth, pgClient).start(port);
     }
 
     /** Device sync is enabled only when DEVICE_PASSWORD (comm key) is set. */

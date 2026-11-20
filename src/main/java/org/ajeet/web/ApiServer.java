@@ -5,7 +5,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import org.ajeet.auth.AuthStore;
 import org.ajeet.device.DeviceClient;
+import org.ajeet.sheets.PostgresSheetsClient;
 import org.ajeet.sheets.SheetsClient;
 
 import java.io.IOException;
@@ -32,14 +34,24 @@ public class ApiServer {
     private final ObjectMapper mapper = new ObjectMapper();
     private final SheetsClient client;
     private final DeviceClient device;
+    private final AuthStore auth;
+    private final PostgresSheetsClient pg;
 
     public ApiServer(SheetsClient client) {
-        this(client, null);
+        this(client, null, null, null);
     }
 
     public ApiServer(SheetsClient client, DeviceClient device) {
+        this(client, device, null, null);
+    }
+
+    /** Full-featured server: auth + attendance endpoints need Postgres mode. */
+    public ApiServer(SheetsClient client, DeviceClient device,
+                     AuthStore auth, PostgresSheetsClient pg) {
         this.client = client;
         this.device = device;
+        this.auth = auth;
+        this.pg = pg;
     }
 
     public void start(int port) throws IOException {
@@ -77,6 +89,58 @@ public class ApiServer {
                     body.put("newest", result.newest().toString());
                     send(ex, 200, body);
                 }
+            } else if (method.equals("POST") && path.equals("/auth/register")) {
+                requireAuth();
+                JsonNode body = readJson(ex);
+                long id = auth.register(body.path("email").asText(""),
+                        body.path("password").asText(""));
+                send(ex, 201, mapper.createObjectNode()
+                        .put("ok", true).put("accountId", id).put("status", "pending"));
+            } else if (method.equals("POST") && path.equals("/auth/login")) {
+                requireAuth();
+                JsonNode body = readJson(ex);
+                AuthStore.Account acct = auth.verify(body.path("email").asText(""),
+                        body.path("password").asText(""));
+                ObjectNode out = accountJson(acct);
+                out.put("token", auth.newSession(acct.id()));
+                send(ex, 200, out);
+            } else if (method.equals("POST") && path.equals("/auth/logout")) {
+                if (auth != null) auth.logout(bearer(ex));
+                send(ex, 200, mapper.createObjectNode().put("ok", true));
+            } else if (method.equals("GET") && path.equals("/auth/me")) {
+                send(ex, 200, accountJson(requireAccount(ex)));
+            } else if (method.equals("GET") && path.equals("/attendance/my")) {
+                AuthStore.Account acct = requireAccount(ex);
+                if (!"active".equals(acct.status()) || acct.enrollNumber() == null)
+                    throw new ForbiddenException("account not yet approved by an admin");
+                send(ex, 200, punchesJson(requireStore().punchesFor(acct.enrollNumber())));
+            } else if (method.equals("GET") && path.equals("/attendance/today")) {
+                requireAdmin(ex);
+                send(ex, 200, punchesJson(requireStore().punchesToday()));
+            } else if (method.equals("GET") && path.equals("/attendance/all")) {
+                requireAdmin(ex);
+                send(ex, 200, punchesJson(requireStore().punchesAll()));
+            } else if (method.equals("GET") && path.equals("/admin/pending")) {
+                requireAdmin(ex);
+                ObjectNode out = mapper.createObjectNode();
+                out.set("accounts", mapper.valueToTree(auth.pendingAccounts()));
+                out.set("deviceUsers", mapper.valueToTree(requireStore().unlinkedUsers()));
+                send(ex, 200, out);
+            } else if (method.equals("GET") && path.equals("/admin/accounts")) {
+                requireAdmin(ex);
+                ObjectNode out = mapper.createObjectNode();
+                out.set("accounts", mapper.valueToTree(auth.allAccounts()));
+                send(ex, 200, out);
+            } else if (method.equals("POST") && path.equals("/admin/approve")) {
+                requireAdmin(ex);
+                JsonNode body = readJson(ex);
+                auth.approve(body.path("accountId").asLong(), body.path("enrollNumber").asInt());
+                send(ex, 200, mapper.createObjectNode().put("ok", true));
+            } else if (method.equals("POST") && path.equals("/admin/reject")) {
+                requireAdmin(ex);
+                JsonNode body = readJson(ex);
+                auth.reject(body.path("accountId").asLong());
+                send(ex, 200, mapper.createObjectNode().put("ok", true));
             } else if (method.equals("GET") && path.equals("/rows")) {
                 ObjectNode body = mapper.createObjectNode();
                 body.set("values", mapper.valueToTree(client.readAll()));
@@ -96,6 +160,10 @@ public class ApiServer {
             } else {
                 send(ex, 404, mapper.createObjectNode().put("error", "not found"));
             }
+        } catch (AuthStore.AuthException e) {
+            send(ex, 401, mapper.createObjectNode().put("error", e.getMessage()));
+        } catch (ForbiddenException e) {
+            send(ex, 403, mapper.createObjectNode().put("error", e.getMessage()));
         } catch (IllegalArgumentException e) {
             send(ex, 400, mapper.createObjectNode().put("error", e.getMessage()));
         } catch (Exception e) {
@@ -135,7 +203,63 @@ public class ApiServer {
     private void addCors(HttpExchange ex) {
         ex.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
         ex.getResponseHeaders().set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-        ex.getResponseHeaders().set("Access-Control-Allow-Headers", "Content-Type");
+        ex.getResponseHeaders().set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    }
+
+    /** Guard errors distinct from 400 validation: missing/expired/forbidden auth. */
+    private static class ForbiddenException extends IOException {
+        ForbiddenException(String msg) { super(msg); }
+    }
+
+    private String bearer(HttpExchange ex) {
+        String h = ex.getRequestHeaders().getFirst("Authorization");
+        return (h != null && h.startsWith("Bearer ")) ? h.substring(7).trim() : null;
+    }
+
+    private void requireAuth() throws IOException {
+        if (auth == null) throw new ForbiddenException("auth needs PostgreSQL mode (PG_URL)");
+    }
+
+    /** Bearer token -> account, or throws 403. */
+    private AuthStore.Account requireAccount(HttpExchange ex) throws IOException {
+        requireAuth();
+        AuthStore.Account acct = auth.resolve(bearer(ex));
+        if (acct == null) throw new ForbiddenException("invalid or expired session");
+        return acct;
+    }
+
+    private void requireAdmin(HttpExchange ex) throws IOException {
+        if (!"admin".equals(requireAccount(ex).role()))
+            throw new ForbiddenException("admin only");
+    }
+
+    private PostgresSheetsClient requireStore() throws IOException {
+        if (pg == null) throw new ForbiddenException("attendance requires PostgreSQL mode");
+        return pg;
+    }
+
+    private JsonNode readJson(HttpExchange ex) throws IOException {
+        try (InputStream in = ex.getRequestBody()) {
+            byte[] raw = in.readAllBytes();
+            return raw.length == 0 ? mapper.createObjectNode() : mapper.readTree(raw);
+        }
+    }
+
+    private ObjectNode accountJson(AuthStore.Account a) {
+        ObjectNode out = mapper.createObjectNode();
+        out.put("id", a.id());
+        out.put("email", a.email());
+        out.put("role", a.role());
+        out.put("status", a.status());
+        out.put("name", a.name());
+        if (a.enrollNumber() != null) out.put("enrollNumber", a.enrollNumber());
+        return out;
+    }
+
+    private JsonNode punchesJson(List<PostgresSheetsClient.AttendancePunch> punches) {
+        ObjectNode out = mapper.createObjectNode();
+        out.set("punches", mapper.valueToTree(punches));
+        return out;
     }
 
     private void send(HttpExchange ex, int status, JsonNode body) throws IOException {
